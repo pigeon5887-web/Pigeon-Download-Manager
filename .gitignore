@@ -13,3 +13,11 @@ downloads/
 .DS_Store
 .idea/
 .vscode/
+
+# NFD 运行缓存与日志
+netdisk-fast-download/db/
+netdisk-fast-download/logs/
+
+# Go 编译产物
+pigeon.exe
+*.syso
