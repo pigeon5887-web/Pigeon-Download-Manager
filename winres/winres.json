@@ -1,0 +1,30 @@
+{
+  "RT_GROUP_ICON": {
+    "#1": {
+      "0000": [
+        "icon.png"
+      ]
+    }
+  },
+  "RT_VERSION": {
+    "#1": {
+      "0000": {
+        "fixed": {
+          "file_version": "1.0.0.0",
+          "product_version": "1.0.0.0"
+        },
+        "info": {
+          "0409": {
+            "CompanyName": "Pigeon",
+            "FileDescription": "Pigeon Download Master",
+            "FileVersion": "1.0.0.0",
+            "InternalName": "pigeon",
+            "OriginalFilename": "pigeon_disk_download.exe",
+            "ProductName": "Pigeon",
+            "ProductVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  }
+}
