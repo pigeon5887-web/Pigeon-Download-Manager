@@ -1,4 +1,4 @@
-# Pigeon Download Manager
+# Pigeon Download Manager V1.1.5
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Version](https://img.shields.io/badge/Go-1.21%2B-blue.svg)](https://golang.org/)
@@ -9,15 +9,16 @@
 ## 核心特性
 
 *   **纯 Go 驱动**：核心调度逻辑完全由 Go 编写，无需安装 Node.js 或 Python 环境。
-*   **高扩展性架构**：内置 `Parser` 接口，目前支持蓝奏云、百度网盘
-*   **无感登录**：利用 `chromedp` 协议，自动唤起本地 Chrome 浏览器扫码，静默提取 HttpOnly Cookie。
+*   **无感登录与安全加密**：支持多浏览器（Edge / Chrome / Brave）唤起扫码，静默提取 HttpOnly Cookie。凭证采用 **AES-256-GCM** 高强度加密存储，保护账号隐私。
+*   **序列号增强下载**：独家定制的增强命令行，支持 `cd <序号>` 进目录、`download <序号1,序号2>` 多选下载，告别手敲长文件名。
 *   **双擎自动调度**：后台自动管理并静默拉起 `aria2c` 与 `BaiduPCS-Go` 引擎，退出程序时自动清理端口，即用即走。
+*   **高扩展性架构**：内置 `Parser` 接口，目前支持蓝奏云、百度网盘，可随时接入更多底层解析引擎。
 
 ## 快速开始
 
-1. 前往本仓库的 **Releases** 页面，下载最新的 `Pigeon-v1.0.0.zip`。
-2. 将压缩包解压到任意文件夹（**请确保所有文件都在同一目录，不要单独移动 exe**）。
-3. 双击运行 `pigeon.exe`。
+1. 前往本仓库的 **Releases** 页面，下载最新的 `Pigeon-v1.1.5-Setup.exe` 安装包。
+2. 双击运行安装程序，按照指引完成安装（建议使用默认路径）。
+3. 安装完成后，双击桌面快捷方式或开始菜单中的 `Pigeon Download Manager` 运行。
 4. **注意**：首次运行如遇 Windows Defender 或杀毒软件拦截，请点击“更多信息” -> “仍要运行”（个人开发者无代码签名，属正常现象）。
 
 ## 使用指南
@@ -28,20 +29,20 @@
 - 输入选项 `1`。
 - 粘贴你的蓝奏云分享链接并回车（支持带密码的链接）。
 - 程序会列出文件列表，输入对应的序号即可自动开始下载。
-- 文件默认保存在 `pigeon.exe` 所在目录的 `downloads` 文件夹内。
+- 文件默认保存在 `pigeon_disk_download.exe` 所在目录的 `downloads` 文件夹内。
 
 ### 2. 进入百度网盘交互模式
 - 输入选项 `2`。
-- **首次使用**：程序会弹出一个干净的浏览器，请**扫码登录**你的百度网盘。登录成功后浏览器会自动关闭，并生成 `baidu_cookie.txt` 保存凭证。下次使用无需再次扫码。
-- 登录成功后，你将进入 `BaiduPCS-Go` 原生命令行模式，支持以下指令：
+- **首次使用**：程序会弹出一个干净的浏览器（可选择 Edge/Chrome/Brave），请**扫码登录**你的百度网盘。登录成功后浏览器会自动关闭，并将凭证**加密保存**为 `baidu_cookie.pigeon`。下次使用无需再次扫码。
+- 登录成功后，你将进入 `百度网盘命令行`，支持以下指令：
     - `ls`：查看当前目录下的文件列表。
-    - `cd <目录名>`：进入指定文件夹。
-    - `download <文件名>`：下载文件。
-        - `-p <线程数>`: 多线程下载，最佳线程目测为4。
-    - `exit`：退出百度网盘模式。
+    - `cd <序号>` 或 `cd "目录名"`：按序号或真实名称进入文件夹。
+    - `download <序号1,序号2>`：按序号多选下载文件。
+    - `download <序号> -p <线程数>`：多线程下载，最佳线程目测为 4，如 `download 1,2 -p 4`。
+    - `quit` 或 `exit`：退出百度网盘模式。
 
 ### 3. 退出程序
-- 在主菜单输入 `q`。程序会自动清理并关闭后台的 Aria2 和 Java 解析服务，释放端口。
+- 在主菜单输入 `q`。程序会自动静默清理并关闭后台的 Aria2 和 Java 解析服务，释放端口。
 
 ## 从源码编译
 
@@ -49,7 +50,7 @@
 
     git clone https://github.com/pigeon5887-web/pigeon-download-manager.git
     cd pigeon-download-manager
-    go build -o pigeon.exe
+    go build -o pigeon_disk_download.exe
 
 ## 第三方组件声明
 
