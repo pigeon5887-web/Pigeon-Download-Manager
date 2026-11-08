@@ -6,10 +6,14 @@ import (
 	"syscall"
 )
 
-// 隐藏控制台窗口 (仅 Windows)
+// 隐藏控制台窗口 + 放进新进程组 (仅 Windows)
+// CREATE_NEW_PROCESS_GROUP 会让子进程对 Ctrl+C 免疫：
+// 不然在百度模式按一次 Ctrl+C，控制台事件会广播出去，
+// 把 aria2 和 Java 解析服务一起带走喵
 func getSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
-		HideWindow: true,
+		HideWindow:    true,
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 }
 

@@ -20,4 +20,8 @@ netdisk-fast-download/logs/
 
 # Go 编译产物
 pigeon.exe
+pigeon_disk_download.exe
 *.syso
+
+# 运行时配置
+pigeon_config.json

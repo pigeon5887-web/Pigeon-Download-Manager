@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -57,15 +60,25 @@ func callAria2(method string, params []interface{}) (interface{}, error) {
 	return rpcResp.Result, nil
 }
 
-func addDownloadTask(url string, dir string, outName string) (string, error) {
+func addDownloadTask(url string, dir string, outName string, referer string, cookie string) (string, error) {
+	// 不同网盘的 CDN 对 Referer/Cookie 要求不一样，由调用方按网盘传
+	headers := []string{
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	}
+	if referer != "" {
+		headers = append(headers, "Referer: "+referer)
+	}
+	if cookie != "" {
+		headers = append(headers, "Cookie: "+cookie)
+	}
 	options := map[string]interface{}{
-		"dir":             dir,
-		"out":             outName,
-		"file-allocation": "none",
-		"header": []string{
-			"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			"Referer: https://www.lanzou.com/",
-		},
+		"dir":                       dir,
+		"out":                       outName,
+		"file-allocation":           "none",
+		"split":                     "16",
+		"max-connection-per-server": "16",
+		"min-split-size":            "1M",
+		"header":                    headers,
 	}
 	params := []interface{}{[]string{url}, options}
 	result, err := callAria2("aria2.addUri", params)
@@ -118,8 +131,42 @@ func generateProgressBar(currentStr, totalStr string) string {
 
 // ================== 监控进度更新 ==================
 
+// watchStopSignal 监听 Ctrl+C，用来"只停止视监、不打断下载"
+// 用完记得 signal.Stop(ch) 归还喵
+func watchStopSignal() chan os.Signal {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	return sigCh
+}
+
+// shortFileName 去掉路径，只留文件名
+func shortFileName(path string) string {
+	if idx := strings.LastIndex(path, "/"); idx != -1 {
+		return path[idx+1:]
+	}
+	if idx := strings.LastIndex(path, "\\"); idx != -1 {
+		return path[idx+1:]
+	}
+	return path
+}
+
+// taskDisplayName 从任务状态里抠出文件名，抠不到就用 gid 兜底
+func taskDisplayName(statusMap map[string]interface{}, gid string) string {
+	if files, ok := statusMap["files"].([]interface{}); ok && len(files) > 0 {
+		if f, ok := files[0].(map[string]interface{}); ok {
+			if p, ok := f["path"].(string); ok && p != "" {
+				return shortFileName(p)
+			}
+		}
+	}
+	return "任务 gid=" + gid
+}
+
 func checkStatus(gid string) {
-	fmt.Println("[+] 开始视监下载进度喵~（按 Ctrl+C 结束）...")
+	sigCh := watchStopSignal()
+	defer signal.Stop(sigCh)
+
+	fmt.Println("[+] 开始视监下载进度喵~（按 Ctrl+C 停止视监，任务会继续在后台跑哦）...")
 	for {
 		result, err := callAria2("aria2.tellStatus", []interface{}{gid})
 		if err != nil {
@@ -127,8 +174,8 @@ func checkStatus(gid string) {
 			return
 		}
 
-		statusMap := result.(map[string]interface{})
-		status := statusMap["status"].(string)
+		statusMap, _ := result.(map[string]interface{})
+		status, _ := statusMap["status"].(string)
 
 		if status == "error" {
 			fmt.Printf("\n%s[error] 下载失败了！主人看看错误代码: %v%s\n", ColorRed, statusMap["errorCode"], ColorReset)
@@ -139,9 +186,9 @@ func checkStatus(gid string) {
 			break
 		}
 
-		totalLen := statusMap["totalLength"].(string)
-		completedLen := statusMap["completedLength"].(string)
-		speed := statusMap["downloadSpeed"].(string)
+		totalLen, _ := statusMap["totalLength"].(string)
+		completedLen, _ := statusMap["completedLength"].(string)
+		speed, _ := statusMap["downloadSpeed"].(string)
 
 		// 清理当前行，防止旧进度条残留
 		fmt.Print("\r\033[K")
@@ -151,9 +198,99 @@ func checkStatus(gid string) {
 			formatBytes(speed),
 		)
 
-		time.Sleep(1 * time.Second) // 单任务监控改成 1 秒刷新，看起来更流畅
+		// 等待刷新的这一秒里顺便听听 Ctrl+C
+		select {
+		case <-sigCh:
+			fmt.Printf("\n%s[ok] 好嘞，本喵先不看了，任务还在后台偷偷跑喵~%s\n", ColorGreen, ColorReset)
+			return
+		case <-time.After(1 * time.Second): // 单任务监控 1 秒刷新，看起来更流畅
+		}
 	}
 	fmt.Println() // 结束后换个行
+}
+
+// checkStatusMulti 视监多个任务，每个任务一行原地刷新，
+// 全部完结或主人按 Ctrl+C 后返回（任务继续在后台跑）
+func checkStatusMulti(gids []string) {
+	sigCh := watchStopSignal()
+	defer signal.Stop(sigCh)
+
+	fmt.Printf("[+] 开始视监 %d 个任务喵~（按 Ctrl+C 停止视监，任务会继续在后台跑哦）...\n", len(gids))
+
+	finalLine := make(map[string]string) // 已完结任务的定格显示行
+	frames := 0
+
+	for {
+		doneCount := 0
+		lines := make([]string, 0, len(gids))
+
+		for _, gid := range gids {
+			if line, ok := finalLine[gid]; ok {
+				lines = append(lines, line)
+				doneCount++
+				continue
+			}
+
+			result, err := callAria2("aria2.tellStatus", []interface{}{gid})
+			if err != nil {
+				finalLine[gid] = fmt.Sprintf("%s[失败] gid=%s 查询失败: %v%s", ColorRed, gid, err, ColorReset)
+				lines = append(lines, finalLine[gid])
+				doneCount++
+				continue
+			}
+
+			statusMap, _ := result.(map[string]interface{})
+			status, _ := statusMap["status"].(string)
+			name := taskDisplayName(statusMap, gid)
+
+			switch status {
+			case "complete":
+				finalLine[gid] = fmt.Sprintf("%s[完成] %s%s", ColorGreen, name, ColorReset)
+				doneCount++
+			case "error":
+				finalLine[gid] = fmt.Sprintf("%s[失败] %s (错误代码: %v)%s", ColorRed, name, statusMap["errorCode"], ColorReset)
+				doneCount++
+			case "removed":
+				finalLine[gid] = fmt.Sprintf("%s[移除] %s%s", ColorGray, name, ColorReset)
+				doneCount++
+			default:
+				// 还在下载中，拼一条实时进度
+				totalLen, _ := statusMap["totalLength"].(string)
+				completedLen, _ := statusMap["completedLength"].(string)
+				speed, _ := statusMap["downloadSpeed"].(string)
+				lines = append(lines, fmt.Sprintf("%s %s | %s / %s | %s/s",
+					name,
+					generateProgressBar(completedLen, totalLen),
+					formatBytes(completedLen),
+					formatBytes(totalLen),
+					formatBytes(speed),
+				))
+				continue
+			}
+			lines = append(lines, finalLine[gid])
+		}
+
+		// 光标上移覆盖上一帧重画，防止进度条刷屏
+		if frames > 0 {
+			fmt.Printf("\033[%dA", len(gids))
+		}
+		for _, line := range lines {
+			fmt.Print("\r\033[K" + line + "\n")
+		}
+		frames++
+
+		if doneCount == len(gids) {
+			fmt.Printf("%s[ok] 这一拨任务都处理完啦喵~%s\n", ColorGreen, ColorReset)
+			return
+		}
+
+		select {
+		case <-sigCh:
+			fmt.Printf("%s[ok] 好嘞，本喵先不看了，没完成的任务还在后台跑喵~%s\n", ColorGreen, ColorReset)
+			return
+		case <-time.After(1 * time.Second):
+		}
+	}
 }
 
 // ================== 全局任务大屏更新 ==================
@@ -188,13 +325,7 @@ func getActiveTasks() {
 		}
 
 		// 提取文件名（去掉前面的绝对路径）
-		shortName := fileName
-		if idx := strings.LastIndex(fileName, "/"); idx != -1 {
-			shortName = fileName[idx+1:]
-		}
-		if idx := strings.LastIndex(shortName, "\\"); idx != -1 {
-			shortName = shortName[idx+1:]
-		}
+		shortName := shortFileName(fileName)
 
 		fmt.Printf("%s文件:%s %s\n", ColorGray, ColorReset, shortName)
 		fmt.Printf("%s      %s | %s / %s | %s/s%s\n",

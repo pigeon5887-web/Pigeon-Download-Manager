@@ -78,6 +78,9 @@ func main() {
 	// 使用 defer 保证退出时静默清理，但不会打断正常运行
 	defer cleanupServices()
 
+	// 加载下载路径等本地配置
+	loadConfig()
+
 	startAria2Daemon()
 	startNfdDaemon()
 
@@ -97,9 +100,12 @@ func main() {
 		fmt.Println("========================================")
 		fmt.Println("1. 解析蓝奏云等链接")
 		fmt.Println("2. 进入百度网盘交互模式")
+		fmt.Println("3. 解析123云盘链接")
+		fmt.Println("4. 解析夸克/UC链接")
+		fmt.Println("5. 设置下载路径")
 		fmt.Println("q. 退出这里喵")
 		fmt.Println("========================================")
-		fmt.Print("请选择功能 (1/2/q): ")
+		fmt.Print("请选择功能 (1/2/3/4/5/q): ")
 		choice, _ := reader.ReadString('\n')
 		choice = strings.TrimSpace(strings.ToLower(choice))
 
@@ -110,9 +116,15 @@ func main() {
 
 		switch choice {
 		case "1":
-			runNfdMode(reader)
+			runNfdMode(reader, "蓝奏云等链接")
 		case "2":
 			runBaiduInteractive(reader)
+		case "3":
+			runNfdMode(reader, "123云盘")
+		case "4":
+			runNfdMode(reader, "夸克/UC")
+		case "5":
+			runDownloadPathMenu(reader)
 		default:
 			fmt.Println(ColorRed + "[error] 输入无效，主人，请重新选择喵" + ColorReset)
 		}
@@ -189,7 +201,7 @@ func getBaiduCookieWithChromedp() (string, error) {
 
 	fmt.Println("\n========================================================")
 	fmt.Println("[!] 主人！快在弹出的浏览器里扫码登录喵~")
-	fmt.Println("========================================================\n")
+	fmt.Println("========================================================")
 
 	var cookieStr string
 	err := chromedp.Run(ctx,
@@ -360,8 +372,8 @@ func runBaiduInteractive(reader *bufio.Reader) {
 		return
 	}
 
-	currentDir, _ := os.Getwd()
-	downloadDir := filepath.Join(currentDir, "downloads")
+	// 下载路径走全局配置，防止软件在 C:\Windows 这类地方时写不进去
+	downloadDir := appConfig.DownloadDir
 	exec.Command("./BaiduPCS-Go.exe", "config", "set", "-savedir", downloadDir).Run()
 
 	fmt.Println(ColorCyan + "\n[+] 认证完成主人！正在进入百度网盘命令行..." + ColorReset)
@@ -549,84 +561,382 @@ func runBaiduInteractive(reader *bufio.Reader) {
 	fmt.Println(ColorGreen + "\n[ok] 已离开百度网盘命令行喵" + ColorReset)
 }
 
-// 蓝奏云解析
-func runNfdMode(reader *bufio.Reader) {
+// 网盘链接解析（蓝奏云/123云盘/夸克/UC/移动云等，NFD 按域名自动路由）
+// 循环交互：Ctrl+C 返回上级菜单，q 返回上一步
+// aria2 的 Referer 按链接域名自动识别（各网盘 CDN 脾气不一样）
+func runNfdMode(reader *bufio.Reader, title string) {
+	// 防止之前的 Ctrl+C 把后台服务误杀后一直躺着，进模式前先给服务做个体检
+	startAria2Daemon()
+	startNfdDaemon()
+
+	// 123盘模式：先看一眼账号配没配，没配提前打个招呼（不拦人）
+	if title == "123云盘" {
+		if user, _, ymlOK := readNfd123Auth(); ymlOK && user == "" {
+			fmt.Printf("%s[i] 还没给解析服务配 123 盘账号，等下解析会撞登录墙（到时可选当场配置喵）%s\n", ColorGray, ColorReset)
+		}
+	}
+
+	// 全程监听 Ctrl+C，方便在解析/推送这种不读键盘的环节里也能及时收手
+	stopCh := make(chan os.Signal, 1)
+	signal.Notify(stopCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(stopCh)
+
 	parser := &NfdParser{APIBase: "http://127.0.0.1:6400"}
 
-	fmt.Print("\n主人~请输入蓝奏云等分享链接喵 (输入 q 返回): ")
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
-	if strings.ToLower(input) == "q" || input == "" {
-		return
-	}
-
-	pwd := ""
-	if u, err := urlParseHelper(input); err == nil {
-		pwd = u
-	}
-
-	var fileList []FileItem
-	var err error
-
 	for {
-		fmt.Println("[+] 主人~正在获取文件列表喵...")
-		fileList, err = parser.GetFileList(input, pwd)
+		fmt.Printf("\n主人~请输入%s的分享链接喵 (输入 q 或按 Ctrl+C 返回): ", title)
+		input, err := reader.ReadString('\n')
 		if err != nil {
-			if strings.Contains(err.Error(), "密码") {
-				fmt.Printf("%s[error] %s%s\n", ColorRed, err.Error(), ColorReset)
-				fmt.Print("[+] 主人~请输入提取码: ")
-				pwdInput, _ := reader.ReadString('\n')
-				pwd = strings.TrimSpace(pwdInput)
-				if pwd == "q" {
-					return
-				}
-				continue
-			}
-			fmt.Printf("%s[error] %s%s\n", ColorRed, err.Error(), ColorReset)
+			// Ctrl+C 或 EOF，返回上级菜单
+			fmt.Println()
 			return
 		}
-		break
-	}
+		input = strings.TrimSpace(input)
+		if strings.ToLower(input) == "q" || input == "" {
+			return
+		}
 
-	if len(fileList) == 0 {
-		return
-	}
+		pwd := ""
+		if u, perr := urlParseHelper(input); perr == nil {
+			pwd = u
+			// 提取码已单独带走；URL 上的查询串不剥掉会让 NFD 认错网盘类型
+			input = stripPwdQuery(input)
+		}
 
+		// 目录导航栈：进入文件夹时压栈，u 返回上一层；apiURL 为空 = 根层（用原始链接取列表）
+		type dirLevel struct {
+			apiURL string
+			name   string
+		}
+		var dirStack []dirLevel
+		current := dirLevel{name: "根目录"}
+		helpShown := false // 命令表只在首次解析成功后列一次
+
+	navLoop:
+		for {
+			// ---- 取当前层的文件列表 ----
+			var fileList []FileItem
+			if current.apiURL == "" {
+				listOK := false
+				for !listOK {
+					fmt.Println("[+] 主人~正在获取文件列表喵...")
+					fileList, err = parser.GetFileList(input, pwd)
+					if err != nil {
+						loginWall := strings.Contains(err.Error(), "登录") || strings.Contains(err.Error(), "认证")
+						// "密码/提取码"是缺提取码；带"登录/认证"的是 123 盘登录墙，别混
+						needPwd := (strings.Contains(err.Error(), "密码") || strings.Contains(err.Error(), "提取码")) && !loginWall
+						if needPwd {
+							fmt.Printf("%s[error] %s%s\n", ColorRed, err.Error(), ColorReset)
+							fmt.Print("[+] 主人~请输入提取码 (输入 q 返回): ")
+							pwdInput, perr := reader.ReadString('\n')
+							if perr != nil {
+								fmt.Println()
+								return
+							}
+							pwd = strings.TrimSpace(pwdInput)
+							if strings.ToLower(pwd) == "q" {
+								break navLoop
+							}
+							continue
+						}
+						fmt.Printf("%s[error] %s%s\n", ColorRed, err.Error(), ColorReset)
+						// 123盘撞登录墙：给指引，并支持当场配置（写 yml + 硬刷新服务后自动重试）
+						if is123PanLink(input) && loginWall {
+							print123AuthHint()
+							if offerNfdAuthSetup(reader) {
+								continue // 服务已带新配置重启，重试获取列表
+							}
+						}
+						break navLoop // 换个链接
+					}
+					listOK = true
+				}
+			} else {
+				fmt.Printf("[+] 正在进入「%s」喵...\n", current.name)
+				ref := current.apiURL
+				if !strings.HasPrefix(ref, "http") { // 自建导航引用（qkdir:/ucdir:）自带会话，不注入提取码
+					ref = injectPwd(ref, pwd)
+				}
+				subList, subErr := parser.GetFileListVia(ref)
+				if subErr != nil {
+					fmt.Printf("%s[error] %s%s\n", ColorRed, subErr, ColorReset)
+					// 进不去就退回上一层
+					if n := len(dirStack); n > 0 {
+						current = dirStack[n-1]
+						dirStack = dirStack[:n-1]
+						continue
+					}
+					break navLoop
+				}
+				fileList = subList
+			}
+
+			if len(fileList) == 0 {
+				fmt.Println("[+] 这个目录是空的喵...")
+				if n := len(dirStack); n > 0 {
+					current = dirStack[n-1]
+					dirStack = dirStack[:n-1]
+					continue
+				}
+				break navLoop
+			}
+
+			printNfdFileList(fileList)
+			if !helpShown {
+				printPanCmdHelp()
+				helpShown = true
+			}
+
+			// ---- 本层的命令循环（和百度网盘交互模式同款命令风格）----
+			// 下载流程：解析直链并推送（arg 为归一化后的 0 / 1,3,5）
+			doDownload := func(arg string) {
+				indices, parseErr := parseFileSelection(arg, len(fileList))
+				if parseErr != nil {
+					fmt.Printf("%s[error] %v%s\n", ColorRed, parseErr, ColorReset)
+					return
+				}
+
+				// 清空之前积压的 Ctrl+C，防止视监时留下的旧信号误伤新一轮解析
+			drainSignals:
+				for {
+					select {
+					case <-stopCh:
+					default:
+						break drainSignals
+					}
+				}
+
+				var gids []string
+				aborted := false
+				for n, idx := range indices {
+					select {
+					case <-stopCh:
+						aborted = true
+					default:
+					}
+					if aborted {
+						fmt.Printf("%s[!] 主人按了 Ctrl+C，剩下的文件先不解析了喵%s\n", ColorRed, ColorReset)
+						break
+					}
+
+					f := fileList[idx]
+					if f.FileType == "folder" {
+						fmt.Printf("%s[!] 跳过文件夹 %s（用 cd %d 进去喵）%s\n", ColorGray, f.FileName, idx+1, ColorReset)
+						continue
+					}
+					fmt.Printf("[+] (%d/%d) 正在解析 %s 的直链喵...\n", n+1, len(indices), f.FileName)
+					directLink, dlCookie, dlErr := parser.GetDirectLink(f.FileID)
+					if dlErr != nil {
+						fmt.Printf("%s[error] %s 解析失败喵: %v%s\n", ColorRed, f.FileName, dlErr, ColorReset)
+						continue
+					}
+					gid, addErr := addDownloadTask(directLink, appConfig.DownloadDir, f.FileName, panReferer(input), dlCookie)
+					if addErr != nil {
+						fmt.Printf("%s[error] %s 推送 aria2 失败喵: %v%s\n", ColorRed, f.FileName, addErr, ColorReset)
+						continue
+					}
+					fmt.Printf("%s[ok] 已推送 %s (GID: %s)%s\n", ColorGreen, f.FileName, gid, ColorReset)
+					gids = append(gids, gid)
+				}
+
+				if len(gids) == 0 {
+					return
+				}
+
+				if len(gids) == 1 {
+					checkStatus(gids[0])
+				} else {
+					checkStatusMulti(gids)
+				}
+				// 视监结束后回到本层命令行，还能继续挑文件或 cd 去别的文件夹
+			}
+
+			// 进入文件夹（idx 为列表下标，0 起算）
+			enterFolder := func(idx int) bool {
+				f := fileList[idx]
+				if f.FileType != "folder" {
+					fmt.Printf("%s[error] %s 不是文件夹喵，下载用 download %d%s\n", ColorRed, f.FileName, idx+1, ColorReset)
+					return false
+				}
+				// 夸克走自建导航引用（SubRef），123盘走 NFD 的 parserUrl
+				ref := f.SubRef
+				if ref == "" {
+					ref = f.ParserURL
+				}
+				if ref == "" {
+					fmt.Printf("%s[error] 这个文件夹没有导航地址喵（NFD 版本可能太旧）%s\n", ColorRed, ColorReset)
+					return false
+				}
+				dirStack = append(dirStack, current)
+				current = dirLevel{apiURL: ref, name: f.FileName}
+				return true
+			}
+
+			goUp := func() {
+				if n := len(dirStack); n > 0 {
+					current = dirStack[n-1]
+					dirStack = dirStack[:n-1]
+				} else {
+					fmt.Println("[i] 已经在最上层了喵")
+				}
+			}
+
+			for {
+				fmt.Printf("\npan[%s] > ", current.name)
+				cmdLine, cerr := reader.ReadString('\n')
+				if cerr != nil {
+					// Ctrl+C 或 EOF，返回上级菜单
+					fmt.Println()
+					return
+				}
+				cmdLine = strings.TrimSpace(cmdLine)
+				if cmdLine == "" {
+					continue
+				}
+				lower := strings.ToLower(cmdLine)
+
+				switch {
+				case lower == "q" || lower == "exit" || lower == "quit":
+					break navLoop // 换链接
+
+				case lower == "ls":
+					continue navLoop // 重新取当前层列表
+
+				case lower == "u" || lower == "cd ..":
+					goUp()
+					continue navLoop
+
+				case lower == "cd":
+					fmt.Printf("%s[error] 用法：cd <序号> 进文件夹，cd .. 返回上级%s\n", ColorRed, ColorReset)
+
+				case strings.HasPrefix(lower, "cd "):
+					arg := strings.TrimSpace(cmdLine[3:])
+					if arg == ".." {
+						goUp()
+						continue navLoop
+					}
+					idx, aerr := strconv.Atoi(arg)
+					if aerr != nil || idx < 1 || idx > len(fileList) {
+						fmt.Printf("%s[error] cd 序号无效喵！范围 1-%d，或 cd .. 返回上级%s\n", ColorRed, len(fileList), ColorReset)
+						continue
+					}
+					if enterFolder(idx - 1) {
+						continue navLoop
+					}
+
+				case lower == "download":
+					fmt.Printf("%s[error] 用法：download 0（全部）/ download 1,3,5（多选）%s\n", ColorRed, ColorReset)
+
+				case strings.HasPrefix(lower, "download "):
+					doDownload(normalizeSelStr(cmdLine[9:]))
+
+				default:
+					// 兼容裸数字：单序号指到文件夹 = 进入，其余 = 下载
+					norm := normalizeSelStr(cmdLine)
+					if isNumericSel(norm) {
+						indices, perr := parseFileSelection(norm, len(fileList))
+						if perr != nil {
+							fmt.Printf("%s[error] %v%s\n", ColorRed, perr, ColorReset)
+							continue
+						}
+						if len(indices) == 1 && fileList[indices[0]].FileType == "folder" {
+							if enterFolder(indices[0]) {
+								continue navLoop
+							}
+							continue
+						}
+						doDownload(norm)
+						continue
+					}
+					fmt.Printf("%s[error] 不认识的命令喵：ls / cd <序号> / cd .. / download <0或1,3,5> / u / q%s\n", ColorRed, ColorReset)
+				}
+			}
+		}
+	}
+}
+
+// printNfdFileList 打印文件列表（干净版：文件夹不带大小，文件带大小）
+func printNfdFileList(fileList []FileItem) {
 	fmt.Println("\n============== 这是文件列表~ ==============")
 	for i, f := range fileList {
-		fmt.Printf("[%d] %s (%s)\n", i+1, f.FileName, f.SizeStr)
+		if f.FileType == "folder" {
+			fmt.Printf("[%d] %s\n", i+1, f.FileName)
+		} else if size := strings.TrimSpace(f.SizeStr); size != "" {
+			fmt.Printf("[%d] %s (%s)\n", i+1, f.FileName, size)
+		} else {
+			fmt.Printf("[%d] %s\n", i+1, f.FileName)
+		}
 	}
 	fmt.Println("==========================================")
+}
 
-	var selectedFile FileItem
-	for {
-		fmt.Printf("请选择序号喵 (1-%d): ", len(fileList))
-		inputStr, _ := reader.ReadString('\n')
-		num, err := strconv.Atoi(strings.TrimSpace(inputStr))
-		if err != nil || num < 1 || num > len(fileList) {
+// printPanCmdHelp 列出网盘链接模式的命令表（链接解析成功后展示一次）
+func printPanCmdHelp() {
+	fmt.Println("--------------- 命令说明 ---------------")
+	fmt.Println("  ls              重新列出当前目录")
+	fmt.Println("  cd <序号>        进入文件夹（如 cd 1）")
+	fmt.Println("  cd .. / u       返回上一级")
+	fmt.Println("  download 0      下载当前目录全部文件")
+	fmt.Println("  download 1,3,5  多选下载")
+	fmt.Println("  q / exit        换个链接")
+	fmt.Println("----------------------------------------")
+}
+
+// print123AuthHint 123盘强制登录时的凭据配置指引
+func print123AuthHint() {
+	fmt.Printf("%s[!] 123云盘现在强制要求登录态才能解析分享，需要给 NFD 配置 123 盘账号喵%s\n", ColorRed, ColorReset)
+	fmt.Println("    方式一：下面输入 y 当场配置（本喵自动写入 yml 并硬刷新解析服务）")
+	fmt.Println("    方式二：手动打开 netdisk-fast-download/resources/app-dev.yml 拉到最底部，")
+	fmt.Println("            在 auths: → ye: 下填 username（账号）和 password（密码），重启工具生效")
+	fmt.Println("    注意：账号密码只保存在本机这个 yml 文件里喵")
+}
+
+// normalizeSelStr 归一化选择串：全角逗号转半角、去空格
+func normalizeSelStr(s string) string {
+	return strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(s, "，", ","), " ", ""))
+}
+
+// isNumericSel 是否纯数字序号串（0 或 1,3,5 这类）
+func isNumericSel(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if !strings.ContainsRune("0123456789,", c) {
+			return false
+		}
+	}
+	return true
+}
+
+// parseFileSelection 解析 "0" / "1,3,5" 这类选择输入，返回文件下标（0 起算）
+// 输入 0 代表全选喵
+func parseFileSelection(selStr string, count int) ([]int, error) {
+	if selStr == "0" {
+		indices := make([]int, 0, count)
+		for i := 0; i < count; i++ {
+			indices = append(indices, i)
+		}
+		return indices, nil
+	}
+
+	var indices []int
+	seen := make(map[int]bool)
+	for _, part := range strings.Split(selStr, ",") {
+		num, err := strconv.Atoi(part)
+		if err != nil || num < 1 || num > count {
+			return nil, fmt.Errorf("序号 %s 无效喵！请输入 1-%d 之间的数字，或 0 全选", part, count)
+		}
+		if seen[num-1] {
 			continue
 		}
-		selectedFile = fileList[num-1]
-		break
+		seen[num-1] = true
+		indices = append(indices, num-1)
 	}
-
-	fmt.Printf("[+] 正在获取直链喏...\n")
-	directLink, err := parser.GetDirectLink(selectedFile.FileID)
-	if err != nil {
-		fmt.Printf("%s[error] %v%s\n", ColorRed, err, ColorReset)
-		return
+	if len(indices) == 0 {
+		return nil, fmt.Errorf("没有选中任何文件喵")
 	}
-
-	fmt.Println("[+] 主人~正在推送到 aria2 喵...")
-	currentDir, _ := os.Getwd()
-	dir := filepath.Join(currentDir, "downloads")
-	gid, err := addDownloadTask(directLink, dir, selectedFile.FileName)
-	if err != nil {
-		fmt.Printf("%s[error] %v%s\n", ColorRed, err, ColorReset)
-		return
-	}
-	fmt.Printf("%s[ok] GID: %s%s\n", ColorGreen, gid, ColorReset)
-	checkStatus(gid)
+	return indices, nil
 }
 
 // 提取链接中的 pwd 参数
